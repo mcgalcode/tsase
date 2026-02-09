@@ -20,6 +20,9 @@ import os,sys
 from copy import deepcopy
 from math import sqrt, atan, pi
 from tsase.neb.util import vmag, vmag2, vunit, vproj, vdot, sPBC
+from tsase.neb.ssneb_utils import (compute_jacobian, interpolate_path,
+                                    initialize_image_properties,
+                                    image_distance_vector)
 from ase import atoms, units
 
 class ssneb:
@@ -89,41 +92,23 @@ class ssneb:
 
         # set the path by linear interpolation between end points
         n = self.numImages - 1
-        self.path = [p1]
-        self.path+= [p1.copy() for i in range(self.numImages-2)]
-        self.path+= [p2]
-        cell1 = p1.get_cell()
-        cell2 = p2.get_cell()
-        dRB   = (cell2 - cell1) / n # path for cell
-        # don't use get_scaled_positions() or apply sPBC() here
-        # if the atoms can move over half of the lattice from initial to final
-        icell = numpy.linalg.inv(cell1)
-        vdir1 = numpy.dot(p1.get_positions(),icell)
-        icell = numpy.linalg.inv(cell2)
-        vdir2 = numpy.dot(p2.get_positions(),icell)
-        dR    = sPBC(vdir2 - vdir1) / n # path for direct coordinates
-        calc  = p1.get_calculator()
+        self.path = interpolate_path(p1, p2, self.numImages)
+        calc = p1.get_calculator()
         for i in range(1, n):
-            # making a directory for each image, which is nessecary for vasp to read last step's WAVECAR
-            # also, it is good to prevent overwriting files for parallelizaiton over images
             fdname = '0'+str(i)
             if (not self.parallel) or (self.parallel and self.rank == 0):
                 if not os.path.exists(fdname): os.mkdir(fdname)
-            cellt = cell1 + dRB * i
-            vdirt = vdir1 + dR * i
-            rt    = numpy.dot(vdirt,cellt)
-            self.path[i].set_cell(cellt)
-            self.path[i].set_positions(rt)
             self.path[i].set_calculator(calc)
         self.Umaxi = 1
 
         # calculate the Jacobian so that a cell move have the same units and weight as an atomic move
-        vol1     = self.path[0].get_volume()
-        vol2     = self.path[self.numImages-1].get_volume()
-        vol      = (vol1+vol2)*0.5
-        self.natom = len(self.path[0]) 
-        avglen   = (vol/self.natom)**(1.0/3.0)
-        self.jacobian = avglen * self.natom**0.5 * self.weight
+        self.natom = len(self.path[0])
+        self.jacobian = compute_jacobian(
+            self.path[0].get_volume(),
+            self.path[self.numImages-1].get_volume(),
+            self.natom,
+            self.weight
+        )
 
         # add some new properties
         for i in [0,n]:
@@ -138,9 +123,7 @@ class ssneb:
             self.path[i].f = self.path[i].get_forces()
             if self.ss: stt = self.path[i].get_stress()
             os.chdir(backfd)
-            self.path[i].cellt = self.path[i].get_cell() * self.jacobian 
-            self.path[i].icell = numpy.linalg.inv(self.path[i].get_cell())
-            self.path[i].vdir  = self.path[i].get_scaled_positions()
+            initialize_image_properties(self.path[i], self.jacobian)
             self.path[i].st = numpy.zeros((3,3))
             # solid-state or not
             if self.ss:
@@ -248,9 +231,7 @@ class ssneb:
         #=========================== End potential energy evaluation ==============================
 
         for i in range(1, self.numImages - 1):
-            self.path[i].cellt = self.path[i].get_cell() * self.jacobian 
-            self.path[i].icell = numpy.linalg.inv(self.path[i].get_cell())
-            self.path[i].vdir  = self.path[i].get_scaled_positions()
+            initialize_image_properties(self.path[i], self.jacobian)
 
             # calculate the PV term in the enthalpy E+PV, setting image 0 as reference
             dcell  = self.path[i].get_cell() - self.path[0].get_cell()
@@ -382,19 +363,8 @@ class ssneb:
                 self.path[i].fPerp = self.path[i].totalf - vproj(self.path[i].totalf,   \
                                                             self.path[i].n)
                 # Calculate the spring force.
-                Rm1  = sPBC(self.path[i - 1].vdir - self.path[i].vdir)
-                avgbox  = 0.5*(self.path[i - 1].get_cell() + self.path[i].get_cell())
-                Rm1  = numpy.dot(Rm1,avgbox) 
-                dh   = self.path[i - 1].cellt - self.path[i].cellt
-                Rm1b = numpy.dot(self.path[i].icell, dh)*0.5 + numpy.dot(self.path[i - 1].icell, dh)*0.5
-                Rm1  = numpy.vstack((Rm1,Rm1b))
-
-                Rp1  = sPBC(self.path[i + 1].vdir - self.path[i].vdir)
-                avgbox  = 0.5*(self.path[i + 1].get_cell() + self.path[i].get_cell())
-                Rp1  = numpy.dot(Rp1,avgbox)
-                dh   = self.path[i + 1].cellt - self.path[i].cellt
-                Rp1b = numpy.dot(self.path[i].icell, dh)*0.5+numpy.dot(self.path[i + 1].icell, dh)*0.5
-                Rp1  = numpy.vstack((Rp1,Rp1b))
+                Rm1 = image_distance_vector(self.path[i - 1], self.path[i])
+                Rp1 = image_distance_vector(self.path[i + 1], self.path[i])
 
                 self.path[i].fsN = (vmag(Rp1) - vmag(Rm1)) * self.k * self.path[i].n
                 #print i, vmag(Rp1),vmag(Rm1)
